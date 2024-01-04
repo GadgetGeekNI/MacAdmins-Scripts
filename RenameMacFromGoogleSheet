@@ -1,0 +1,74 @@
+# The purpose of this script is to reach out to Google sheets, try to match the serial number
+# with the name in the adjacent column. If it finds a match, it will pick that name.
+# If it does not, it will pick a random unused name (Without a serial) and then send us 
+# a slack notification telling the team to add it.
+
+# the Google Sheet identifier from the published URL 
+sheetID="$3"
+
+# Variables for Slack
+LoggedInUser=$( echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ && ! /loginwindow/ { print $3 }' )
+
+# Send a Slack notification if the asset does not exist in Google Sheet
+Slackhook="$4"
+
+sendSlackNotificationNeedsAdded () {
+Hostname=$(hostname -f)
+Serialnumber=$(system_profiler SPHardwareDataType | grep -i "serial number" | cut -d ":" -f2 |cut -d " " -f2)
+  curl -X POST --data-urlencode 'payload={"channel": "#is_jamfalerts", "text": "Hi there! The Serial Number of '$Hostname' cannot be found in the <https://docs.google.com/spreadsheets/d/1cV0r3IA3WQ1HoVqI39WnxOZDFpdwR73EIvrU4568KTc/edit#gid=0|Google Sheet>, Please log in and ensure that the serialnumber '$Serialnumber' is now associated with the hostname '$Hostname'. This machine is associated with '$LoggedInUser'"}' https://hooks.slack.com/services/$Slackhook
+}
+
+# Name the device using best value. Ensure that trailing quotes are removed.
+RenameMacbook () {
+  dname=$(echo $dname | cut -d '"' -f 2)
+  scutil --set LocalHostName "$dname"
+  scutil --set ComputerName "$dname"
+  scutil --set HostName  "$dname"
+  jamf setComputerName -name "$dname"
+  jamf recon
+}
+
+# Pick a random unused name in the event that the serialnumber is missing from Google Sheets. Export the CSV to var/tmp/unusednames.csv. Take a count of each individual line without a serial number. Pick a random number/line. Assign unused line to variable and delete the csv.
+PickRandomName () {  
+  curl --silent "https://docs.google.com/spreadsheets/d/$sheetID/gviz/tq?tqx=out:csv&tq=%20select%20$nameCol%20WHERE%20$serialCol%3D%27%27" -o /var/tmp/unusednames.csv
+  sed -i '' 1d unusednames.csv
+  CellCount=$(cat /var/tmp/unusednames.csv | wc -l)
+  CellNumber=$(jot -r 1 1 $CellCount)
+  dname=$(sed -n "$CellNumber"p /var/tmp/unusednames.csv)
+  echo "Picked $dname as this machines new hostname."
+  rm /var/tmp/unusednames.csv
+}
+
+# letter designation of the column in the sheet for the device serial numbers
+serialCol="B"
+
+# letter designation of the column in the sheet for the custom device name
+nameCol="A"
+
+# get the device serial number
+serialNumber="$(ioreg -l | grep IOPlatformSerialNumber | sed -e 's/.*\"\(.*\)\"/\1/')"
+
+# uncomment for debug
+echo $serialNumber
+
+#Look up serial number from Google Sheet using the Google API. Default variable value is Added, if the serial isn't found then it will change to Missing and act accordingly.
+dname=$(curl --silent "https://docs.google.com/spreadsheets/d/$sheetID/gviz/tq?tqx=out:csv&tq=%20select%20$nameCol%20WHERE%20$serialCol%3D%27$serialNumber%27")
+CSVStatus="Added"
+if [[ -z $dname ]]; then
+CSVStatus="Missing"
+fi
+
+# uncomment for debug
+echo $dname
+
+if [[ $CSVStatus == "Added" ]]; then
+  echo "All is well in the world! Renaming & Exiting"
+  RenameMacbook
+  exit 0
+elif [[ $CSVStatus == "Missing" ]]; then
+  echo "The devices serial number isn't in Google Sheets. Picking a random name, Renaming & Sending Slack Notification as it is missing."
+  PickRandomName
+  RenameMacbook
+  sendSlackNotificationNeedsAdded
+  exit 0
+fi
